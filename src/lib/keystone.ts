@@ -1,7 +1,6 @@
-// Keystone v3 client with the calls nipa needs to turn a password and OTP code
-// into a project-scoped token, switch projects and revoke the token.
-
 import { z } from "zod";
+
+import { request } from "./http";
 
 export const ProjectSchema = z.object({
   domainId: z.string().optional(),
@@ -28,7 +27,6 @@ export class KeystoneError extends Error {
   }
 }
 
-/** Accepts `https://host`, `https://host/` or `https://host/v3/` and returns `https://host/v3`. */
 export const identityUrl = (authUrl: string): string => {
   let base = authUrl;
   while (base.endsWith("/")) {
@@ -40,11 +38,10 @@ export const identityUrl = (authUrl: string): string => {
   return `${base}/v3`;
 };
 
-export interface PasswordTotpInput {
+export interface Account {
+  authUrl: string;
   username: string;
   userDomain: string;
-  password: string;
-  passcode: string;
   projectId?: string;
 }
 
@@ -53,104 +50,89 @@ interface UserRef {
   domain: { name: string };
 }
 
+type Identity =
+  | {
+      methods: ["password"];
+      password: { user: UserRef & { password: string } };
+    }
+  | { methods: ["totp"]; totp: { user: UserRef & { passcode: string } } }
+  | { methods: ["token"]; token: { id: string } };
+
 interface AuthRequest {
-  auth: {
-    identity:
-      | {
-          methods: ["password", "totp"];
-          password: { user: UserRef & { password: string } };
-          totp: { user: UserRef & { passcode: string } };
-        }
-      | { methods: ["token"]; token: { id: string } };
-    scope?: { project: { id: string } };
-  };
+  auth: { identity: Identity; scope?: { project: { id: string } } };
 }
 
-/**
- * Password and TOTP in one request. Keystone checks both against the user's
- * MFA rules; without a project the token is unscoped.
- */
-export const passwordTotpBody = (input: PasswordTotpInput): AuthRequest => {
-  const user: UserRef = {
-    domain: { name: input.userDomain },
-    name: input.username,
-  };
-  const request: AuthRequest = {
-    auth: {
-      identity: {
-        methods: ["password", "totp"],
-        password: { user: { ...user, password: input.password } },
-        totp: { user: { ...user, passcode: input.passcode } },
-      },
-    },
-  };
-  if (input.projectId) {
-    request.auth.scope = { project: { id: input.projectId } };
-  }
-  return request;
-};
+const authRequest = (identity: Identity, projectId?: string): AuthRequest =>
+  projectId
+    ? { auth: { identity, scope: { project: { id: projectId } } } }
+    : { auth: { identity } };
 
-/** A token and the Keystone that issued it, for calls made with that token. */
-export interface TokenRequest {
-  authUrl: string;
-  token: string;
-}
-
-export interface RescopeRequest extends TokenRequest {
-  projectId: string;
-}
-
-/** Exchanges an existing token for one scoped to another project. */
-export const rescopeBody = ({
-  token,
-  projectId,
-}: Pick<RescopeRequest, "token" | "projectId">): AuthRequest => ({
-  auth: {
-    identity: { methods: ["token"], token: { id: token } },
-    scope: { project: { id: projectId } },
-  },
+const userRef = (account: Account): UserRef => ({
+  domain: { name: account.userDomain },
+  name: account.username,
 });
+
+export const passwordBody = (account: Account, password: string): AuthRequest =>
+  authRequest(
+    {
+      methods: ["password"],
+      password: { user: { ...userRef(account), password } },
+    },
+    account.projectId
+  );
+
+export const totpBody = (account: Account, passcode: string): AuthRequest =>
+  authRequest(
+    { methods: ["totp"], totp: { user: { ...userRef(account), passcode } } },
+    account.projectId
+  );
+
+export const rescopeBody = (token: string, projectId: string): AuthRequest =>
+  authRequest({ methods: ["token"], token: { id: token } }, projectId);
 
 const ErrorSchema = z.object({
   error: z.object({ message: z.string().optional() }).optional(),
-  // An auth receipt: the credentials were right but did not satisfy the MFA rules.
   receipt: z.object({}).loose().optional(),
   required_auth_methods: z.array(z.array(z.string())).optional(),
 });
 
-type KeystoneErrorBody = z.infer<typeof ErrorSchema>;
+type ErrorBody = z.infer<typeof ErrorSchema>;
 
-/** Turns a failed response into a sentence a user can act on. */
-export const errorMessage = (
-  status: number,
-  body: KeystoneErrorBody
-): string => {
+const readError = async (res: Response): Promise<ErrorBody> => {
+  try {
+    const parsed = ErrorSchema.safeParse(JSON.parse(await res.text()));
+    return parsed.success ? parsed.data : {};
+  } catch {
+    return {};
+  }
+};
+
+export const errorMessage = (input: {
+  status: number;
+  body: ErrorBody;
+  unauthorized: string;
+}): string => {
+  const { body, status } = input;
   if (body.receipt) {
     const rules = (body.required_auth_methods ?? []).map((rule) =>
       rule.join(" + ")
     );
     return rules.length > 0
       ? `this account needs ${rules.join(" or ")} to log in`
-      : "this account's MFA rules do not allow this login method";
+      : "this account's MFA rules don't allow this login method";
   }
   if (status === 401) {
-    return "invalid username, password or OTP code";
+    return input.unauthorized;
   }
   return body.error?.message ?? `Keystone returned HTTP ${status}`;
 };
 
-const fail = async (res: Response): Promise<never> => {
-  const text = await res.text();
-  let body: KeystoneErrorBody = {};
-  try {
-    const parsed = ErrorSchema.safeParse(JSON.parse(text));
-    if (parsed.success) {
-      body = parsed.data;
-    }
-  } catch {
-    // not JSON, e.g. an HTML page from a proxy
-  }
-  throw new KeystoneError(errorMessage(res.status, body), res.status);
+const fail = async (res: Response, unauthorized: string): Promise<never> => {
+  const body = await readError(res);
+  throw new KeystoneError(
+    errorMessage({ body, status: res.status, unauthorized }),
+    res.status
+  );
 };
 
 const TokenSchema = z.object({
@@ -167,10 +149,7 @@ const TokenSchema = z.object({
   }),
 });
 
-export const toToken = (
-  value: string,
-  body: z.infer<typeof TokenSchema>
-): Token => {
+const toToken = (value: string, body: z.infer<typeof TokenSchema>): Token => {
   const { expires_at: expiresAt, project, user } = body.token;
   return {
     expiresAt,
@@ -184,18 +163,28 @@ export const toToken = (
   };
 };
 
-const issue = async (authUrl: string, request: AuthRequest): Promise<Token> => {
-  const res = await fetch(`${identityUrl(authUrl)}/auth/tokens?nocatalog`, {
-    body: JSON.stringify(request),
-    headers: { "Content-Type": "application/json" },
+const RECEIPT_HEADER = "Openstack-Auth-Receipt";
+
+const postToken = (
+  authUrl: string,
+  body: AuthRequest,
+  receipt?: string
+): Promise<Response> => {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (receipt !== undefined) {
+    headers.set(RECEIPT_HEADER, receipt);
+  }
+  return request(`${identityUrl(authUrl)}/auth/tokens?nocatalog`, {
+    body: JSON.stringify(body),
+    headers,
     method: "POST",
   });
-  if (!res.ok) {
-    return fail(res);
-  }
+};
+
+const readToken = async (res: Response): Promise<Token> => {
   const value = res.headers.get("X-Subject-Token");
   if (!value) {
-    throw new KeystoneError("Keystone did not return a token", res.status);
+    throw new KeystoneError("Keystone didn't return a token", res.status);
   }
   const parsed = TokenSchema.safeParse(await res.json());
   if (!parsed.success) {
@@ -207,16 +196,69 @@ const issue = async (authUrl: string, request: AuthRequest): Promise<Token> => {
   return toToken(value, parsed.data);
 };
 
-export const loginWithPasswordTotp = ({
-  authUrl,
-  ...input
-}: PasswordTotpInput & { authUrl: string }): Promise<Token> =>
-  issue(authUrl, passwordTotpBody(input));
+type PasswordResult =
+  | { kind: "token"; token: Token }
+  | { kind: "mfa"; receipt: string };
 
-export const rescope = ({
-  authUrl,
-  ...request
-}: RescopeRequest): Promise<Token> => issue(authUrl, rescopeBody(request));
+/**
+ * Accounts without MFA get a token. Accounts whose MFA rules include TOTP get
+ * an auth receipt to send with the OTP code.
+ */
+export const loginWithPassword = async (
+  account: Account,
+  password: string
+): Promise<PasswordResult> => {
+  const res = await postToken(account.authUrl, passwordBody(account, password));
+  if (res.ok) {
+    return { kind: "token", token: await readToken(res) };
+  }
+  const receipt = res.headers.get(RECEIPT_HEADER);
+  if (res.status === 401 && receipt) {
+    const body = await readError(res);
+    const wantsTotp = (body.required_auth_methods ?? []).some((rule) =>
+      rule.includes("totp")
+    );
+    if (wantsTotp) {
+      return { kind: "mfa", receipt };
+    }
+    throw new KeystoneError(
+      errorMessage({ body, status: res.status, unauthorized: "" }),
+      res.status
+    );
+  }
+  return fail(res, "wrong email or password");
+};
+
+export const continueWithTotp = async (input: {
+  account: Account;
+  receipt: string;
+  passcode: string;
+}): Promise<Token> => {
+  const { account, passcode, receipt } = input;
+  const res = await postToken(
+    account.authUrl,
+    totpBody(account, passcode),
+    receipt
+  );
+  return res.ok ? readToken(res) : fail(res, "wrong OTP code");
+};
+
+interface TokenRequest {
+  authUrl: string;
+  token: string;
+}
+
+const SESSION_GONE = "the session expired or was revoked";
+
+export const rescope = async (
+  input: TokenRequest & { projectId: string }
+): Promise<Token> => {
+  const res = await postToken(
+    input.authUrl,
+    rescopeBody(input.token, input.projectId)
+  );
+  return res.ok ? readToken(res) : fail(res, SESSION_GONE);
+};
 
 const ProjectsSchema = z.object({
   projects: z.array(
@@ -229,22 +271,21 @@ const ProjectsSchema = z.object({
   ),
 });
 
-export const toProjects = (body: z.infer<typeof ProjectsSchema>): Project[] =>
+const toProjects = (body: z.infer<typeof ProjectsSchema>): Project[] =>
   body.projects
     .filter((p) => p.enabled !== false)
     .map((p) => ({ domainId: p.domain_id, id: p.id, name: p.name }))
     .toSorted((a, b) => a.name.localeCompare(b.name));
 
-/** Projects the token's user can scope to, sorted by name. */
 export const listProjects = async ({
   authUrl,
   token,
 }: TokenRequest): Promise<Project[]> => {
-  const res = await fetch(`${identityUrl(authUrl)}/auth/projects`, {
+  const res = await request(`${identityUrl(authUrl)}/auth/projects`, {
     headers: { "X-Auth-Token": token },
   });
   if (!res.ok) {
-    return fail(res);
+    return fail(res, SESSION_GONE);
   }
   const parsed = ProjectsSchema.safeParse(await res.json());
   if (!parsed.success) {
@@ -260,13 +301,34 @@ export const revoke = async ({
   authUrl,
   token,
 }: TokenRequest): Promise<void> => {
-  const res = await fetch(`${identityUrl(authUrl)}/auth/tokens`, {
+  const res = await request(`${identityUrl(authUrl)}/auth/tokens`, {
     headers: { "X-Auth-Token": token, "X-Subject-Token": token },
     method: "DELETE",
   });
-  // The token authenticates its own revocation, so 401 and 404 both mean it is
-  // already expired or revoked, which is what we wanted anyway.
+  // The token authenticates its own revocation, so 401 and 404 mean it's already invalid.
   if (!(res.ok || res.status === 401 || res.status === 404)) {
-    await fail(res);
+    await fail(res, SESSION_GONE);
   }
+};
+
+const VersionSchema = z.object({
+  version: z.object({ id: z.string(), status: z.string() }),
+});
+
+export const probe = async (authUrl: string): Promise<string> => {
+  const url = identityUrl(authUrl);
+  const res = await request(url, { signal: AbortSignal.timeout(10_000) });
+  let parsed: ReturnType<typeof VersionSchema.safeParse>;
+  try {
+    parsed = VersionSchema.safeParse(await res.json());
+  } catch {
+    parsed = VersionSchema.safeParse(null);
+  }
+  if (!(res.ok && parsed.success)) {
+    throw new KeystoneError(
+      `${url} doesn't answer like Keystone v3 (HTTP ${res.status})`,
+      res.status
+    );
+  }
+  return parsed.data.version.id;
 };

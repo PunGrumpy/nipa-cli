@@ -1,7 +1,5 @@
 import { parseArgs } from "node:util";
 
-import { spinner } from "@clack/prompts";
-
 import {
   detectShell,
   formatEnv,
@@ -10,156 +8,158 @@ import {
   SHELLS,
 } from "../lib/env";
 import { listProjects, rescope, revoke } from "../lib/keystone";
+import type { Project } from "../lib/keystone";
 import {
   clearSession,
   isActive,
-  loadConfig,
   loadSession,
   msUntilExpiry,
-  saveConfig,
-  saveSession,
 } from "../lib/store";
-import type { Session } from "../lib/store";
 import {
+  askChoice,
   bold,
+  canPrompt,
   CliError,
   dim,
   formatDuration,
+  log,
   note,
-  promptOptions,
   success,
+  withSpinner,
 } from "../lib/ui";
-import { login, pickProject, toSession } from "./login";
+import {
+  activeProfile,
+  loginCommand,
+  pickProject,
+  requireSession,
+  saveLogin,
+  toSession,
+} from "./login";
+import type { Globals } from "./login";
 
-const notLoggedIn = () =>
-  new CliError("you are not logged in", { hint: "Run `nipa login` first." });
+interface CommandInput {
+  args: string[];
+  globals: Globals;
+}
 
-/** The current session; logs in first when there is none and a terminal can ask. */
-export const requireSession = async (): Promise<Session> => {
-  const session = await loadSession();
-  if (isActive(session)) {
-    return session;
-  }
-  if (!process.stdin.isTTY) {
-    throw session
-      ? new CliError("your session expired", { hint: "Run `nipa login`." })
-      : notLoggedIn();
-  }
-  return login();
-};
-
-export const whoamiUsage = `Usage: nipa whoami [--json]
-
-Show the user, project and how long the session has left.
-`;
-
-export const whoami = async (args: string[]): Promise<number> => {
+export const whoami = async ({
+  args,
+  globals,
+}: CommandInput): Promise<number> => {
   const { values } = parseArgs({
     args,
     options: { json: { type: "boolean" } },
   });
-  const [config, session] = await Promise.all([loadConfig(), loadSession()]);
+  const active = await activeProfile(globals);
+  const session = await loadSession(active.name);
   if (!isActive(session)) {
-    throw notLoggedIn();
+    if (values.json) {
+      console.log(JSON.stringify({ loggedIn: false, profile: active.name }));
+    }
+    throw new CliError(`you aren't logged in to ${active.name}`, {
+      hint: `Run \`${loginCommand(active.name)}\`.`,
+    });
   }
   if (values.json) {
     const out = {
-      authUrl: config.authUrl,
+      authUrl: active.profile.authUrl,
       expiresAt: session.expiresAt,
+      loggedIn: true,
+      profile: active.name,
       project: session.project,
-      region: config.region,
+      region: active.profile.region,
       user: session.user,
     };
     console.log(JSON.stringify(out, null, 2));
     return 0;
   }
+  if (!process.stdout.isTTY) {
+    console.log(session.user.name);
+    return 0;
+  }
+  const { host } = new URL(active.profile.authUrl);
+  const expiresIn = formatDuration(msUntilExpiry(session));
+  log(`Logged in as ${bold(session.user.name)}`);
+  const where = dim(`(${host}, ${active.profile.region})`);
   const projectId = dim(`(${session.project.id})`);
-  console.log(session.user.name);
-  console.error(`  ${dim("project")}  ${session.project.name} ${projectId}`);
-  console.error(`  ${dim("region")}   ${config.region}`);
-  console.error(
-    `  ${dim("expires")}  in ${formatDuration(msUntilExpiry(session))}`
-  );
+  log(`Profile: ${bold(active.name)} ${where}`);
+  log(`Project: ${bold(session.project.name)} ${projectId}`);
+  log(`The session expires in ${expiresIn}`);
   return 0;
 };
 
-export const switchUsage = `Usage: nipa switch [project]
+const askProject = (current: Project) => (projects: readonly Project[]) =>
+  askChoice({
+    choices: projects.map((p) => ({
+      description: p.id,
+      name: p.id === current.id ? `${p.name} ${bold("(current)")}` : p.name,
+      value: p,
+    })),
+    default: projects.find((p) => p.id === current.id),
+    message: "Switch to:",
+  });
 
-Scope the session to another project, by name or ID. Without an argument,
-pick from a list. No password or OTP code is needed.
-`;
-
-export const switchProject = async (args: string[]): Promise<number> => {
+export const switchProject = async ({
+  args,
+  globals,
+}: CommandInput): Promise<number> => {
   const { positionals } = parseArgs({
     allowPositionals: true,
     args,
     options: {},
   });
-  const config = await loadConfig();
-  const session = await requireSession();
-  const projects = await listProjects({
-    authUrl: config.authUrl,
-    token: session.token,
+  const [wanted] = positionals;
+  const { active, session } = await requireSession(globals);
+  const { authUrl } = active.profile;
+  const projects = await withSpinner("Loading your projects…", () =>
+    listProjects({ authUrl, token: session.token })
+  );
+  if (wanted === undefined && !canPrompt()) {
+    throw new CliError("tell nipa which project to use", {
+      exitCode: 2,
+      hint: `Run \`nipa switch <project>\`. Your projects: ${projects.map((p) => p.name).join(", ")}`,
+    });
+  }
+  const project = await pickProject({
+    ask: askProject(session.project),
+    projects,
+    wanted,
   });
-  const project = await pickProject(projects, positionals[0]);
   if (project.id === session.project.id) {
-    success(`Already using ${bold(project.name)}`);
+    note(`You're already using ${bold(project.name)}`);
     return 0;
   }
-  const spin = spinner(promptOptions);
-  spin.start(`Switching to ${project.name}`);
-  let next: Session;
-  try {
-    next = toSession(
-      await rescope({
-        authUrl: config.authUrl,
-        projectId: project.id,
-        token: session.token,
-      }),
-      project
-    );
-  } finally {
-    spin.clear();
-  }
-  await saveSession(next);
-  await saveConfig({ ...config, project: next.project });
-  success(`Switched to ${bold(next.project.name)}`);
+  const started = performance.now();
+  const token = await withSpinner(`Switching to ${project.name}…`, () =>
+    rescope({ authUrl, projectId: project.id, token: session.token })
+  );
+  await saveLogin({ active, session: toSession(token, project) });
+  success(`Switched to ${bold(project.name)}`, performance.now() - started);
   return 0;
 };
 
-export const logoutUsage = `Usage: nipa logout
-
-Revoke the token and delete the saved session. Your username and last project
-are kept for the next login.
-`;
-
-export const logout = async (): Promise<number> => {
-  const [config, session] = await Promise.all([loadConfig(), loadSession()]);
+export const logout = async ({ globals }: CommandInput): Promise<number> => {
+  const active = await activeProfile(globals);
+  const session = await loadSession(active.name);
   if (!session) {
-    note("Not currently logged in, so `nipa logout` did nothing");
+    note(`Not logged in to ${active.name}, so \`nipa logout\` did nothing`);
     return 0;
   }
   if (isActive(session)) {
     try {
-      await revoke({ authUrl: config.authUrl, token: session.token });
+      await withSpinner("Logging out…", () =>
+        revoke({ authUrl: active.profile.authUrl, token: session.token })
+      );
     } catch {
-      // Best effort: the local session is deleted either way, and the token expires on its own.
+      // The token expires on its own.
     }
   }
-  await clearSession();
-  success("Logged out!");
+  await clearSession(active.name);
+  success(`Logged out of ${bold(active.name)}`);
   return 0;
 };
 
-export const envUsage = `Usage: nipa env [--shell bash|zsh|fish]
-
-Print the OS_* variables for the session, to load them into your shell:
-
-  eval "$(nipa env)"     # bash, zsh
-  nipa env | source      # fish
-`;
-
-export const env = async (args: string[]): Promise<number> => {
+export const env = async ({ args, globals }: CommandInput): Promise<number> => {
   const { values } = parseArgs({
     args,
     options: { shell: { type: "string" } },
@@ -171,7 +171,9 @@ export const env = async (args: string[]): Promise<number> => {
       hint: `Use one of: ${SHELLS.join(", ")}.`,
     });
   }
-  const [config, session] = await Promise.all([loadConfig(), requireSession()]);
-  console.log(formatEnv(sessionEnv(config, session), shell));
+  const { active, session } = await requireSession(globals);
+  console.log(
+    formatEnv(sessionEnv({ profile: active.profile, session }), shell)
+  );
   return 0;
 };

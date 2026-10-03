@@ -1,9 +1,12 @@
-// Shared setup for tests that run nipa as a process.
-
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { FAKE_USER } from "./fake-keystone";
+import {
+  ALPHA_ID,
+  FAKE_PASSCODE,
+  FAKE_PASSWORD,
+  FAKE_USER,
+} from "./fake-keystone";
 
 export const ENTRY = path.join(import.meta.dir, "..", "src", "index.ts");
 
@@ -13,7 +16,7 @@ export interface RunResult {
   stderr: string;
 }
 
-/** Runs a command and collects its output; stdin is closed, like a script. */
+/** stdin is closed, so nipa can't prompt. */
 export const runProcess = async (
   cmd: string[],
   env: Record<string, string>
@@ -32,7 +35,6 @@ export const runProcess = async (
   return { code, stderr, stdout };
 };
 
-/** The environment a test process sees: a private HOME and config dir, no colors. */
 export const testEnv = (dir: string) => ({
   HOME: dir,
   NIPA_CONFIG_DIR: dir,
@@ -40,7 +42,6 @@ export const testEnv = (dir: string) => ({
   PATH: `${path.join(dir, "bin")}:${process.env.PATH ?? ""}`,
 });
 
-/** Puts a `nipa` wrapper on the test PATH, for completion scripts that call `nipa __complete`. */
 export const installNipaShim = async (dir: string): Promise<void> => {
   const bin = path.join(dir, "bin");
   await mkdir(bin, { recursive: true });
@@ -49,38 +50,71 @@ export const installNipaShim = async (dir: string): Promise<void> => {
   await chmod(shim, 0o755);
 };
 
-/** A session as `nipa login` would save it, with a real token from the fake Keystone. */
-export const seedSession = async (
-  dir: string,
-  keystoneUrl: string
-): Promise<void> => {
+const issueToken = async (keystoneUrl: string): Promise<string> => {
   const res = await fetch(`${keystoneUrl}/v3/auth/tokens`, {
     body: JSON.stringify({
       auth: {
         identity: {
           methods: ["password", "totp"],
-          password: { user: { name: FAKE_USER.name, password: "secret" } },
-          totp: { user: { passcode: "123456" } },
+          password: { user: { name: FAKE_USER.name, password: FAKE_PASSWORD } },
+          totp: { user: { name: FAKE_USER.name, passcode: FAKE_PASSCODE } },
         },
-        scope: { project: { id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } },
+        scope: { project: { id: ALPHA_ID } },
       },
     }),
     method: "POST",
   });
-  const token = res.headers.get("X-Subject-Token") ?? "";
+  return res.headers.get("X-Subject-Token") ?? "";
+};
+
+const alpha = { domainId: "d1", id: ALPHA_ID, name: "Alpha" };
+
+export const seedSession = async (
+  dir: string,
+  keystoneUrl: string
+): Promise<void> => {
+  const token = await issueToken(keystoneUrl);
+  const prod = {
+    authUrl: keystoneUrl,
+    project: alpha,
+    region: "NCP-TH",
+    userDomain: "nipacloud",
+    username: FAKE_USER.name,
+  };
   await writeFile(
     path.join(dir, "config.json"),
-    JSON.stringify({ authUrl: keystoneUrl, username: FAKE_USER.name })
+    JSON.stringify({ currentProfile: "prod", profiles: { prod } })
+  );
+  const session = {
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    project: alpha,
+    token,
+    user: FAKE_USER,
+  };
+  await writeFile(
+    path.join(dir, "auth.json"),
+    JSON.stringify({ sessions: { prod: session } })
+  );
+};
+
+export const seedLegacySession = async (
+  dir: string,
+  keystoneUrl: string
+): Promise<void> => {
+  const token = await issueToken(keystoneUrl);
+  await writeFile(
+    path.join(dir, "config.json"),
+    JSON.stringify({
+      authUrl: keystoneUrl,
+      project: alpha,
+      username: FAKE_USER.name,
+    })
   );
   await writeFile(
     path.join(dir, "auth.json"),
     JSON.stringify({
       expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-      project: {
-        domainId: "d1",
-        id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        name: "Alpha",
-      },
+      project: alpha,
       token,
       user: FAKE_USER,
     })

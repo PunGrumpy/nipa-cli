@@ -1,44 +1,108 @@
 import { parseArgs } from "node:util";
 
-import { password, select, spinner, text } from "@clack/prompts";
-
 import {
+  continueWithTotp,
   KeystoneError,
   listProjects,
-  loginWithPasswordTotp,
+  loginWithPassword,
   rescope,
 } from "../lib/keystone";
-import type { Project, Token } from "../lib/keystone";
-import { loadConfig, saveConfig, saveSession } from "../lib/store";
-import type { Config, Session } from "../lib/store";
+import type { Account, Project, Token } from "../lib/keystone";
 import {
-  answered,
+  DEFAULT_PROFILE,
+  isActive,
+  loadConfig,
+  loadSession,
+  saveConfig,
+  saveSession,
+} from "../lib/store";
+import type { Config, Profile, Session } from "../lib/store";
+import {
+  askChoice,
+  askSecret,
+  askText,
   bold,
+  canPrompt,
   CliError,
   dim,
-  formatDuration,
-  info,
-  promptOptions,
+  log,
   success,
+  withSpinner,
 } from "../lib/ui";
+
+export interface Globals {
+  profile?: string;
+}
+
+interface ActiveProfile {
+  config: Config;
+  name: string;
+  profile: Profile;
+}
+
+export const activeProfile = async (
+  globals: Globals
+): Promise<ActiveProfile> => {
+  const config = await loadConfig();
+  const name =
+    globals.profile ?? process.env.NIPA_PROFILE ?? config.currentProfile;
+  const profile = config.profiles[name];
+  if (!profile) {
+    const known = Object.keys(config.profiles).join(", ");
+    throw new CliError(`no profile named "${name}"`, {
+      hint: `Your profiles: ${known}. Add one with \`nipa profile add ${name}\`.`,
+    });
+  }
+  return { config, name, profile };
+};
+
+export const loginCommand = (profile: string): string =>
+  profile === DEFAULT_PROFILE ? "nipa login" : `nipa login -P ${profile}`;
+
+export interface LoginPrompts {
+  email: (previous?: string) => Promise<string>;
+  password: () => Promise<string>;
+  otp: (attempt: number) => Promise<string>;
+  project: (projects: readonly Project[]) => Promise<Project>;
+}
 
 const OTP_PATTERN = /^\d{6}$/u;
 const PROJECT_ID_PATTERN = /^[\da-f]{32}$/u;
+const OTP_ATTEMPTS = 3;
 
-export const loginUsage = `Usage: nipa login [options]
+const terminalPrompts: LoginPrompts = {
+  email: (previous) =>
+    askText({
+      default: previous,
+      message: "Email",
+      validate: (value) =>
+        value.includes("@") || "Enter the email you log in to the portal with",
+    }),
+  otp: (attempt) =>
+    askText({
+      message: attempt === 1 ? "OTP code" : "Next OTP code",
+      validate: (value) =>
+        OTP_PATTERN.test(value) ||
+        "Enter the 6-digit code from your authenticator app",
+    }),
+  password: () => askSecret("Password"),
+  project: (projects) =>
+    askChoice({
+      choices: projects.map((p) => ({
+        description: p.id,
+        name: p.name,
+        value: p,
+      })),
+      message: "Which project?",
+    }),
+};
 
-Log in to Nipa Cloud with your password and an OTP code. nipa saves the token
-in ~/.config/nipa/auth.json and reuses it until it expires.
-
-Options:
-  -u, --username <email>   log in as this user (default: the last one)
-  -p, --project <name|id>  scope to this project (default: the last one, or ask)
-`;
-
-export const pickProject = async (
-  projects: Project[],
-  wanted?: string
-): Promise<Project> => {
+export const pickProject = (input: {
+  projects: readonly Project[];
+  wanted?: string;
+  ask: LoginPrompts["project"];
+}): Promise<Project> => {
+  const { projects, wanted } = input;
   if (wanted) {
     const match = projects.find((p) => p.id === wanted || p.name === wanted);
     if (!match) {
@@ -46,26 +110,13 @@ export const pickProject = async (
         hint: `Your projects: ${projects.map((p) => p.name).join(", ")}`,
       });
     }
-    return match;
+    return Promise.resolve(match);
   }
-  const [only] = projects;
-  if (projects.length === 1 && only) {
-    return only;
-  }
-  if (projects.length === 0) {
+  const [first, ...rest] = projects;
+  if (!first) {
     throw new CliError("your account has no projects you can use");
   }
-  return answered(
-    await select({
-      ...promptOptions,
-      message: "Which project?",
-      options: projects.map((p) => ({
-        hint: p.id.slice(0, 8),
-        label: p.name,
-        value: p,
-      })),
-    })
-  );
+  return rest.length === 0 ? Promise.resolve(first) : input.ask(projects);
 };
 
 export const toSession = (token: Token, project: Project): Session => ({
@@ -75,119 +126,162 @@ export const toSession = (token: Token, project: Project): Session => ({
   user: token.user,
 });
 
-interface AuthenticateInput {
-  config: Config;
-  credentials: { username: string; password: string; passcode: string };
-  /** A project name or ID from --project; falls back to the last project used. */
-  wantedProject?: string;
-}
-
-const authenticate = async ({
-  config,
-  credentials,
-  wantedProject,
-}: AuthenticateInput): Promise<Session> => {
-  const { authUrl } = config;
-  const base = { ...credentials, userDomain: config.userDomain };
-
-  // With a project ID, one request is enough. Otherwise log in unscoped, list
-  // the projects and rescope. The OTP code works once, so never repeat the
-  // password step.
-  const known = wantedProject ?? config.project?.id;
-  if (known && PROJECT_ID_PATTERN.test(known)) {
-    const token = await loginWithPasswordTotp({
-      ...base,
-      authUrl,
-      projectId: known,
-    });
-    if (!token.project) {
-      throw new CliError("Keystone returned an unscoped token");
+const verifyOtp = async (input: {
+  account: Account;
+  receipt: string;
+  ask: LoginPrompts["otp"];
+}): Promise<Token> => {
+  // Each attempt waits for the person's next code.
+  /* oxlint-disable no-await-in-loop */
+  for (let attempt = 1; ; attempt += 1) {
+    const passcode = await input.ask(attempt);
+    try {
+      return await withSpinner("Checking the code…", () =>
+        continueWithTotp({
+          account: input.account,
+          passcode,
+          receipt: input.receipt,
+        })
+      );
+    } catch (error) {
+      const wrongCode = error instanceof KeystoneError && error.status === 401;
+      if (!wrongCode || attempt === OTP_ATTEMPTS) {
+        throw error;
+      }
+      log(
+        "That code didn't work. Each code works once, so wait for the next one."
+      );
     }
+  }
+  /* oxlint-enable no-await-in-loop */
+};
+
+export const authenticate = async (input: {
+  profile: Profile;
+  prompts: LoginPrompts;
+  username?: string;
+  wantedProject?: string;
+}): Promise<Session> => {
+  const { profile, prompts, wantedProject } = input;
+  const username = input.username ?? (await prompts.email(profile.username));
+  const password = await prompts.password();
+
+  // With a known project ID, the login scopes the token in the same request.
+  const known = wantedProject ?? profile.project?.id;
+  const account: Account = {
+    authUrl: profile.authUrl,
+    projectId: known && PROJECT_ID_PATTERN.test(known) ? known : undefined,
+    userDomain: profile.userDomain,
+    username,
+  };
+
+  const first = await withSpinner("Checking your password…", () =>
+    loginWithPassword(account, password)
+  );
+  const token =
+    first.kind === "token"
+      ? first.token
+      : await verifyOtp({ account, ask: prompts.otp, receipt: first.receipt });
+  if (token.project) {
     return toSession(token, token.project);
   }
 
-  const unscoped = await loginWithPasswordTotp({ ...base, authUrl });
-  const projects = await listProjects({ authUrl, token: unscoped.value });
-  const project = await pickProject(projects, known);
-  const scoped = await rescope({
-    authUrl,
-    projectId: project.id,
-    token: unscoped.value,
+  const projects = await withSpinner("Loading your projects…", () =>
+    listProjects({ authUrl: profile.authUrl, token: token.value })
+  );
+  const project = await pickProject({
+    ask: prompts.project,
+    projects,
+    wanted: known,
   });
+  const scoped = await withSpinner(`Switching to ${project.name}…`, () =>
+    rescope({
+      authUrl: profile.authUrl,
+      projectId: project.id,
+      token: token.value,
+    })
+  );
   return toSession(scoped, project);
 };
 
-export const login = async (args: string[] = []): Promise<Session> => {
+export const saveLogin = async (input: {
+  active: ActiveProfile;
+  session: Session;
+}): Promise<void> => {
+  const { active, session } = input;
+  const profile = {
+    ...active.profile,
+    project: session.project,
+    username: session.user.name,
+  };
+  await saveConfig({
+    ...active.config,
+    profiles: { ...active.config.profiles, [active.name]: profile },
+  });
+  await saveSession({ profile: active.name, session });
+};
+
+const interactiveLogin = async (input: {
+  active: ActiveProfile;
+  username?: string;
+  wantedProject?: string;
+}): Promise<Session> => {
+  const { active } = input;
+  if (!canPrompt()) {
+    throw new CliError(
+      "`nipa login` needs a terminal to ask for your password",
+      {
+        hint: "Run it in a terminal, then run this command again.",
+      }
+    );
+  }
+  const host = dim(`(${new URL(active.profile.authUrl).host})`);
+  log(`Logging in to ${bold(active.name)} ${host}`);
+  const session = await authenticate({
+    ...input,
+    profile: active.profile,
+    prompts: terminalPrompts,
+  });
+  await saveLogin({ active, session });
+  const who = bold(session.user.name);
+  success(`Logged in as ${who}, project ${bold(session.project.name)}`);
+  return session;
+};
+
+/** Logs in first when the session expired and nipa can prompt. */
+export const requireSession = async (
+  globals: Globals
+): Promise<{ active: ActiveProfile; session: Session }> => {
+  const active = await activeProfile(globals);
+  const session = await loadSession(active.name);
+  if (isActive(session)) {
+    return { active, session };
+  }
+  const hint = `Run \`${loginCommand(active.name)}\`.`;
+  if (!canPrompt()) {
+    throw session
+      ? new CliError(`your ${active.name} session expired`, { hint })
+      : new CliError(`you aren't logged in to ${active.name}`, { hint });
+  }
+  log(session ? "Your session expired." : "You aren't logged in yet.");
+  return { active, session: await interactiveLogin({ active }) };
+};
+
+export const login = async (input: {
+  args: string[];
+  globals: Globals;
+}): Promise<number> => {
   const { values } = parseArgs({
-    args,
+    args: input.args,
     options: {
       project: { short: "p", type: "string" },
       username: { short: "u", type: "string" },
     },
   });
-  if (!process.stdin.isTTY) {
-    throw new CliError(
-      "nipa login needs a terminal to ask for your password and OTP code"
-    );
-  }
-
-  const config = await loadConfig();
-  const host = dim(`(${new URL(config.authUrl).host})`);
-  info(`Log in to Nipa Cloud ${host}`);
-
-  const username =
-    values.username ??
-    config.username ??
-    answered(
-      await text({
-        ...promptOptions,
-        message: "Email",
-        validate: (v) =>
-          v?.includes("@") ? undefined : "Enter the email you use for Space",
-      })
-    );
-  if (values.username === undefined && config.username) {
-    info(`Username ${bold(username)}`);
-  }
-  const pass = answered(
-    await password({ ...promptOptions, message: "Password" })
-  );
-  const passcode = answered(
-    await text({
-      ...promptOptions,
-      message: "OTP code",
-      validate: (v) =>
-        OTP_PATTERN.test(v ?? "") ? undefined : "Enter the 6-digit code",
-    })
-  );
-
-  const spin = spinner({ ...promptOptions, indicator: "timer" });
-  spin.start("Verifying");
-  let session: Session;
-  try {
-    session = await authenticate({
-      config,
-      credentials: { passcode, password: pass, username },
-      wantedProject: values.project,
-    });
-    spin.clear();
-  } catch (error) {
-    spin.clear();
-    if (error instanceof KeystoneError) {
-      throw new CliError(error.message, {
-        hint:
-          error.status === 401
-            ? "OTP codes work once; wait for the next code."
-            : undefined,
-      });
-    }
-    throw error;
-  }
-
-  await saveConfig({ ...config, project: session.project, username });
-  await saveSession(session);
-  const expiresIn = formatDuration(Date.parse(session.expiresAt) - Date.now());
-  const detail = dim(`(${session.project.name}, expires in ${expiresIn})`);
-  success(`Logged in as ${bold(session.user.name)} ${detail}`);
-  return session;
+  await interactiveLogin({
+    active: await activeProfile(input.globals),
+    username: values.username,
+    wantedProject: values.project,
+  });
+  return 0;
 };

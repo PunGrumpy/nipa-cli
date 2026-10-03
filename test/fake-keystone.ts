@@ -1,12 +1,14 @@
-// A tiny Keystone that enforces password + TOTP, for tests.
+// me@example.com has the MFA rule password + totp. plain@example.com has no MFA.
 
 import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
 export const FAKE_USER = { id: "u1", name: "me@example.com" };
+export const PLAIN_USER = { id: "u2", name: "plain@example.com" };
 export const FAKE_PASSWORD = "secret";
 export const FAKE_PASSCODE = "123456";
+export const ALPHA_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 const PROJECTS = [
   {
@@ -21,28 +23,33 @@ const PROJECTS = [
     id: "cccccccccccccccccccccccccccccccc",
     name: "Gone",
   },
-  {
-    domain_id: "d1",
-    enabled: true,
-    id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    name: "Alpha",
-  },
+  { domain_id: "d1", enabled: true, id: ALPHA_ID, name: "Alpha" },
 ];
+
+const USERS = new Map([
+  [FAKE_USER.name, { mfa: true, user: FAKE_USER }],
+  [PLAIN_USER.name, { mfa: false, user: PLAIN_USER }],
+]);
 
 export interface FakeKeystone {
   url: string;
+  requests: string[];
   stop: () => void;
 }
+
+const UserSchema = z.object({ name: z.string().optional() });
 
 const AuthSchema = z.object({
   auth: z.object({
     identity: z.object({
       methods: z.array(z.string()),
       password: z
-        .object({ user: z.object({ password: z.string() }) })
+        .object({ user: UserSchema.extend({ password: z.string() }) })
         .optional(),
       token: z.object({ id: z.string() }).optional(),
-      totp: z.object({ user: z.object({ passcode: z.string() }) }).optional(),
+      totp: z
+        .object({ user: UserSchema.extend({ passcode: z.string() }) })
+        .optional(),
     }),
     scope: z.object({ project: z.object({ id: z.string() }) }).optional(),
   }),
@@ -61,68 +68,85 @@ const unauthorized = () =>
     { status: 401 }
   );
 
-/** What Keystone returns when the credentials are right but the MFA rules are not met. */
-const authReceipt = () =>
-  Response.json(
-    {
-      receipt: { methods: ["password"] },
-      required_auth_methods: [["password", "totp"]],
-    },
-    { status: 401 }
-  );
+export const startFakeKeystone = (): FakeKeystone => {
+  const tokens = new Map<string, typeof FAKE_USER>();
+  const receipts = new Map<string, typeof FAKE_USER>();
+  const requests: string[] = [];
 
-const tokenBody = (projectId: string | undefined) => {
-  const project = PROJECTS.find((p) => p.id === projectId);
-  return {
-    token: {
+  const issue = (
+    user: typeof FAKE_USER,
+    projectId: string | undefined
+  ): Response => {
+    const project = PROJECTS.find((p) => p.id === projectId);
+    if (projectId && !project) {
+      return unauthorized();
+    }
+    const value = `tok-${randomUUID()}`;
+    tokens.set(value, user);
+    const token = {
       expires_at: new Date(Date.now() + 24 * 3_600_000).toISOString(),
-      methods: ["password", "totp"],
       project: project && {
         domain: { id: project.domain_id },
         id: project.id,
         name: project.name,
       },
-      user: { ...FAKE_USER, domain: { id: "d1", name: "nipacloud" } },
-    },
+      user: { ...user, domain: { id: "d1", name: "nipacloud" } },
+    };
+    return Response.json(
+      { token },
+      { headers: { "X-Subject-Token": value }, status: 201 }
+    );
   };
-};
 
-export const startFakeKeystone = (): FakeKeystone => {
-  const tokens = new Set<string>();
+  const receiptFor = (user: typeof FAKE_USER): Response => {
+    const receipt = `rcpt-${randomUUID()}`;
+    receipts.set(receipt, user);
+    return Response.json(
+      {
+        receipt: { methods: ["password"] },
+        required_auth_methods: [["password", "totp"]],
+      },
+      { headers: { "Openstack-Auth-Receipt": receipt }, status: 401 }
+    );
+  };
 
-  const issue = (projectId: string | undefined): Response => {
-    if (projectId && !PROJECTS.some((p) => p.id === projectId)) {
-      return Response.json(
-        { error: { message: "project not found" } },
-        { status: 401 }
-      );
+  const verifyUser = (
+    req: Request,
+    identity: Identity,
+    projectId?: string
+  ): Response => {
+    const receipt = req.headers.get("Openstack-Auth-Receipt");
+    const fromReceipt = receipt ? receipts.get(receipt) : undefined;
+    const name = identity.password?.user.name ?? identity.totp?.user.name ?? "";
+    const account = USERS.get(name);
+    const user = fromReceipt ?? account?.user;
+    const passwordOk =
+      fromReceipt !== undefined ||
+      identity.password?.user.password === FAKE_PASSWORD;
+    if (!(user && passwordOk)) {
+      return unauthorized();
     }
-    const value = `tok-${randomUUID()}`;
-    tokens.add(value);
-    return Response.json(tokenBody(projectId), {
-      headers: { "X-Subject-Token": value },
-      status: 201,
-    });
+    if (!account?.mfa) {
+      return issue(user, projectId);
+    }
+    if (!identity.methods.includes("totp")) {
+      return receiptFor(user);
+    }
+    return identity.totp?.user.passcode === FAKE_PASSCODE
+      ? issue(user, projectId)
+      : unauthorized();
   };
 
   const verify = (
+    req: Request,
     identity: Identity,
-    projectId: string | undefined
+    projectId?: string
   ): Response => {
-    if (identity.methods.includes("token")) {
-      return tokens.has(identity.token?.id ?? "")
-        ? issue(projectId)
-        : unauthorized();
+    if (!identity.methods.includes("token")) {
+      return verifyUser(req, identity, projectId);
     }
-    if (identity.password?.user.password !== FAKE_PASSWORD) {
-      return unauthorized();
-    }
-    if (!identity.methods.includes("totp")) {
-      return authReceipt();
-    }
-    return identity.totp?.user.passcode === FAKE_PASSCODE
-      ? issue(projectId)
-      : unauthorized();
+    const user = tokens.get(identity.token?.id ?? "");
+    return user ? issue(user, projectId) : unauthorized();
   };
 
   const authTokens = async (req: Request): Promise<Response> => {
@@ -140,6 +164,7 @@ export const startFakeKeystone = (): FakeKeystone => {
       );
     }
     return verify(
+      req,
       parsed.data.auth.identity,
       parsed.data.auth.scope?.project.id
     );
@@ -148,6 +173,10 @@ export const startFakeKeystone = (): FakeKeystone => {
   const server = Bun.serve({
     fetch: (req) => {
       const { pathname } = new URL(req.url);
+      requests.push(`${req.method} ${pathname}`);
+      if (pathname === "/v3" || pathname === "/v3/") {
+        return Response.json({ version: { id: "v3.14", status: "stable" } });
+      }
       if (pathname === "/v3/auth/tokens") {
         return authTokens(req);
       }
@@ -162,6 +191,7 @@ export const startFakeKeystone = (): FakeKeystone => {
   });
 
   return {
+    requests,
     stop: () => server.stop(true),
     url: `http://localhost:${server.port}`,
   };

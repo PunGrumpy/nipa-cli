@@ -1,6 +1,4 @@
 #!/usr/bin/env bun
-// Compiles a standalone `nipa` binary for every release platform into dist/,
-// as nipa-<os>-<arch>[.exe] plus a SHA256SUMS file.
 
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -18,7 +16,7 @@ const root = path.join(import.meta.dir, "..");
 const dist = path.join(root, "dist");
 await mkdir(dist, { recursive: true });
 
-// Build one target at a time. Each downloads its own Bun runtime, and the log stays in order.
+// One target at a time, so the build log stays in order.
 /* oxlint-disable no-await-in-loop */
 const sums: string[] = [];
 for (const { name, target } of TARGETS) {
